@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.16)
 project(uhd_sample_recorder)
 set(CMAKE_BUILD_TYPE Release)
 set(SRC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
+set(CMAKE_CXX_STANDARD 20)
 include(FindPkgConfig)
 include(CTest)
 
@@ -11,6 +12,7 @@ find_package(Vulkan REQUIRED)
 find_package(Armadillo REQUIRED)
 find_package(UHD 3.15.0 REQUIRED)
 find_package(nlohmann_json 3.11.2 REQUIRED)
+find_package(libsigmf REQUIRED)
 
 find_package(
   Boost ${Boost_Version}
@@ -51,4 +53,4 @@ add_test(NAME sample_pipeline_test COMMAND sample_pipeline_test)
 
 add_executable(uhd_sample_recorder uhd_sample_recorder.cpp)
 target_link_libraries(uhd_sample_recorder sample_pipeline sample_writer
-                      ${Boost_LIBRARIES} ${UHD_LIBRARIES})
+                      ${Boost_LIBRARIES} ${UHD_LIBRARIES} libsigmf::libsigmf)

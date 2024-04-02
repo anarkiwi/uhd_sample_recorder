@@ -260,11 +260,15 @@ void sample_pipeline_start(const std::string &file, const std::string &fft_file,
   writer_threads->add_thread(new boost::thread(fft_out_worker));
 }
 
-void sample_pipeline_stop(size_t overflows) {
+void sample_pipeline_stop(size_t overflows, const std::string &file,
+                          size_t rate, size_t freq, double timestamp,
+                          double gain, const std::string &sigmf_format) {
   samples_input_done = true;
   writer_threads->join_all();
   sample_writer->close(overflows);
   fft_sample_writer->close(overflows);
+  sample_writer->write_sigmf(file + ".sigmf-meta", timestamp, sigmf_format,
+                             rate, freq, gain);
   if (useVkFFT) {
     free_vkfft();
   }

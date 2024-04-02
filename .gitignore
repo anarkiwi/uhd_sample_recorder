@@ -33,7 +33,9 @@
 
 build/
 sigpack*
-json.hpp
+flatbuffers
+json
+libsigmf
 VkFFT
 SPIRV-Tools
 *~
