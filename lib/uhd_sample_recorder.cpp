@@ -214,8 +214,7 @@ int parse_args(int argc, char *argv[]) {
   desc.add_options()("help", "help message")(
       "args", po::value<std::string>(&uhd_args)->default_value(""),
       "multi uhd device address args")(
-      "file",
-      po::value<std::string>(&file)->default_value("usrp_samples.dat.zst"),
+      "file", po::value<std::string>(&file)->default_value(""),
       "name of the file to write binary samples to")(
       "type", po::value<std::string>(&type)->default_value("short"),
       "sample type: double, float, or short")(
@@ -233,8 +232,9 @@ int parse_args(int argc, char *argv[]) {
       "RF center frequency in Hz")(
       "lo-offset", po::value<double>(&lo_offset)->default_value(0.0),
       "Offset for frontend LO in Hz (optional)")(
-      "gain", po::value<double>(&gain), "gain for the RF chain")(
-      "ant", po::value<std::string>(&ant), "antenna selection")(
+      "gain", po::value<double>(&gain)->default_value(0.0),
+      "gain for the RF chain")("ant", po::value<std::string>(&ant),
+                               "antenna selection")(
       "subdev", po::value<std::string>(&subdev), "subdevice specification")(
       "channel", po::value<size_t>(&channel)->default_value(0),
       "which channel to use")("bw", po::value<double>(&bw),
@@ -294,6 +294,21 @@ int parse_args(int argc, char *argv[]) {
   if (spb == 0) {
     spb = rate;
     std::cerr << "defaulting spb to rate (" << spb << ")" << std::endl;
+  }
+
+  if (!file.size()) {
+    std::stringstream ss;
+    ss << "gamutrf_recording_gain" << std::fixed << std::setprecision(1) << gain
+       << std::setprecision(0) << "_" << std::time(0) << "_" << uint64_t(freq)
+       << "Hz"
+       << "_" << uint64_t(rate) << "sps";
+    if (type == "short") {
+      ss << ".s16";
+    } else {
+      ss << ".raw";
+    }
+    ss << ".zst";
+    file = ss.str();
   }
 
   if (!fft_file.size()) {
