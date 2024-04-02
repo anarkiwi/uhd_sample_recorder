@@ -10,6 +10,8 @@ include(CTest)
 find_package(Vulkan REQUIRED)
 find_package(Armadillo REQUIRED)
 find_package(UHD 3.15.0 REQUIRED)
+find_package(nlohmann_json 3.11.2 REQUIRED)
+
 find_package(
   Boost ${Boost_Version}
   COMPONENTS filesystem iostreams thread unit_test_framework program_options
