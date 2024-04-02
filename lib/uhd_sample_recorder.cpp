@@ -5,14 +5,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <thread>
 #include <uhd/exception.hpp>
 #include <uhd/types/tune_request.hpp>
 #include <uhd/usrp/multi_usrp.hpp>
 #include <uhd/utils/safe_main.hpp>
 #include <uhd/utils/thread.hpp>
-
-#include "json.hpp"
 
 #include "sample_pipeline.h"
 #include "sample_writer.h"
