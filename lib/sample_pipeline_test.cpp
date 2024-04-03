@@ -10,7 +10,7 @@ BOOST_AUTO_TEST_CASE(SmokeTest) {
   set_sample_pipeline_types("short", cpu_format);
   BOOST_TEST(cpu_format == "sc16");
   sample_pipeline_start("", "", 1e6, 1, false, 0, 0, 1, 1, 1e6, 0, 0);
-  sample_pipeline_stop(0);
+  sample_pipeline_stop(0, "", 1e6, 1e6, 1.1, -1, "ci16_le");
 }
 
 BOOST_AUTO_TEST_CASE(RandomFFTTest) {
@@ -33,7 +33,7 @@ BOOST_AUTO_TEST_CASE(RandomFFTTest) {
   memcpy(buffer_p, samples.memptr(),
          samples.size() * sizeof(std::complex<float>));
   enqueue_samples(write_ptr);
-  sample_pipeline_stop(0);
+  sample_pipeline_stop(0, file, 1e3 * 1024, 100e6, 1.1, -1, "cf32_le");
   arma::Col<std::complex<float>> disk_samples;
   disk_samples.copy_size(samples);
   FILE *samples_fp = fopen(file.c_str(), "rb");

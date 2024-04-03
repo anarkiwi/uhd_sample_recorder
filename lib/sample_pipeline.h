@@ -10,6 +10,8 @@ void sample_pipeline_start(const std::string &file, const std::string &fft_file,
                            size_t nfft_ds_, size_t rate, size_t batches,
                            size_t sample_id);
 size_t get_samp_size();
-void sample_pipeline_stop(size_t overflows);
+void sample_pipeline_stop(size_t overflows, const std::string &file,
+                          size_t rate, size_t freq, double timestamp,
+                          double gain, const std::string &sigmf_format);
 void set_sample_pipeline_types(const std::string &type,
                                std::string &cpu_format);

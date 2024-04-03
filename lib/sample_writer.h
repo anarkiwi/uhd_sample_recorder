@@ -11,6 +11,9 @@ public:
   void open(const std::string &file, size_t zlevel);
   void close(size_t overflows);
   void write(const char *data, size_t len);
+  void write_sigmf(const std::string &filename, double timestamp,
+                   const std::string &datatype, double sample_rate,
+                   double frequency, double gain);
 
 private:
   boost::scoped_ptr<boost::iostreams::filtering_ostream> outbuf_p;

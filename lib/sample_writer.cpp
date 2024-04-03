@@ -3,6 +3,7 @@
 #include <boost/iostreams/filter/gzip.hpp>
 #include <boost/iostreams/filter/zstd.hpp>
 #include <iostream>
+#include <sigmf/sigmf.h>
 
 std::string get_prefix_file(const std::string &file,
                             const std::string &prefix) {
@@ -62,4 +63,34 @@ void SampleWriter::close(size_t overflows) {
       rename(dotfile_.c_str(), file_.c_str());
     }
   }
+}
+
+void SampleWriter::write_sigmf(const std::string &filename, double timestamp,
+                               const std::string &datatype, double sample_rate,
+                               double frequency, double gain) {
+  sigmf::SigMF<
+      sigmf::Global<sigmf::core::DescrT>,
+      sigmf::Capture<sigmf::core::DescrT, sigmf::capture_details::DescrT>,
+      sigmf::Annotation<sigmf::core::DescrT>>
+      record;
+  record.global.access<sigmf::core::GlobalT>().datatype = datatype;
+  record.global.access<sigmf::core::GlobalT>().sample_rate = sample_rate;
+  auto capture =
+      sigmf::Capture<sigmf::core::DescrT, sigmf::capture_details::DescrT>();
+  capture.get<sigmf::core::DescrT>().sample_start = 0;
+  capture.get<sigmf::core::DescrT>().global_index = 0;
+  capture.get<sigmf::core::DescrT>().frequency = frequency;
+  std::ostringstream ts_ss;
+  time_t timestamp_t = static_cast<time_t>(timestamp);
+  ts_ss << std::put_time(gmtime(&timestamp_t), "%FT%TZ");
+  capture.get<sigmf::core::DescrT>().datetime = ts_ss.str();
+  capture.get<sigmf::capture_details::DescrT>().source_file =
+      basename(file_.c_str());
+  capture.get<sigmf::capture_details::DescrT>().gain = gain;
+  record.captures.emplace_back(capture);
+  std::string dotfilename = get_dotfile(filename);
+  std::ofstream jsonfile(dotfilename);
+  jsonfile << record.to_json();
+  jsonfile.close();
+  rename(dotfilename.c_str(), filename.c_str());
 }

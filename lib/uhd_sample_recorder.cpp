@@ -1,3 +1,4 @@
+#include <bit>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/program_options.hpp>
 #include <chrono>
@@ -176,6 +177,11 @@ void sample_record(uhd::usrp::multi_usrp::sptr usrp, const std::string &type,
   std::cerr << "max_samps_per_packet from stream: " << max_samps_per_packet
             << std::endl;
 
+  const std::string endian_str =
+      std::endian::native == std::endian::little ? "_le" : "_be";
+  const std::string sigmf_format =
+      type == "short" ? "ci16" + endian_str : "cf32" + endian_str;
+
   if (nfft) {
     std::cerr << "using FFT point size " << nfft << std::endl;
 
@@ -200,10 +206,16 @@ void sample_record(uhd::usrp::multi_usrp::sptr usrp, const std::string &type,
   bool overflows =
       run_stream(rx_stream, time_requested, max_samples, num_requested_samples);
 
+  double timestamp =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::high_resolution_clock::now().time_since_epoch())
+          .count() /
+      1e3;
   stream_cmd.stream_mode = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
   rx_stream->issue_stream_cmd(stream_cmd);
   std::cerr << "stream stopped" << std::endl;
-  sample_pipeline_stop(overflows);
+  sample_pipeline_stop(overflows, file, rate, freq, timestamp, gain,
+                       sigmf_format);
   std::cerr << "pipeline stopped" << std::endl;
 }
 
@@ -216,7 +228,7 @@ int parse_args(int argc, char *argv[]) {
       "file", po::value<std::string>(&file)->default_value(""),
       "name of the file to write binary samples to")(
       "type", po::value<std::string>(&type)->default_value("short"),
-      "sample type: double, float, or short")(
+      "sample type: float, or short")(
       "nsamps", po::value<size_t>(&total_num_samps)->default_value(0),
       "total number of samples to receive")(
       "duration", po::value<double>(&total_time)->default_value(0),
