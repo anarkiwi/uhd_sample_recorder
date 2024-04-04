@@ -75,6 +75,7 @@ void SampleWriter::write_sigmf(const std::string &filename, double timestamp,
       record;
   record.global.access<sigmf::core::GlobalT>().datatype = datatype;
   record.global.access<sigmf::core::GlobalT>().sample_rate = sample_rate;
+  record.global.access<sigmf::core::GlobalT>().version = "1.0.0";
   auto capture =
       sigmf::Capture<sigmf::core::DescrT, sigmf::capture_details::DescrT>();
   capture.get<sigmf::core::DescrT>().sample_start = 0;

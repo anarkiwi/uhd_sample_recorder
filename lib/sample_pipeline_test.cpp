@@ -34,6 +34,9 @@ BOOST_AUTO_TEST_CASE(RandomFFTTest) {
          samples.size() * sizeof(std::complex<float>));
   enqueue_samples(write_ptr);
   sample_pipeline_stop(0, file, 1e3 * 1024, 100e6, 1.1, -1, "cf32_le");
+  std::string sigmf_validate_cli =
+      "sigmf_validate --skip-checksum " + file + ".sigmf-meta";
+  BOOST_TEST(std::system(sigmf_validate_cli.c_str()) == 0);
   arma::Col<std::complex<float>> disk_samples;
   disk_samples.copy_size(samples);
   FILE *samples_fp = fopen(file.c_str(), "rb");
