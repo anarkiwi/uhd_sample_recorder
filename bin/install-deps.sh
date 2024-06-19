@@ -8,6 +8,7 @@ sudo apt-get update && sudo apt-get install -qy \
   libboost-all-dev \
   libuhd-dev \
   libvulkan-dev \
+  python3-numpy \
   python3-pip \
   unzip \
   valgrind \
