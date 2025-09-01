@@ -4,14 +4,15 @@ project(uhd_sample_recorder)
 set(CMAKE_BUILD_TYPE Release)
 set(SRC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 set(CMAKE_CXX_STANDARD 20)
+set(ENABLE_STATIC_LIBS ON)
 include(FindPkgConfig)
 include(CTest)
 
 # TODO: use find_package(SPIRV-Tools) when supported.
 find_package(Vulkan REQUIRED)
 find_package(Armadillo REQUIRED)
-find_package(UHD 3.15.0 REQUIRED)
-find_package(nlohmann_json 3.11.2 REQUIRED)
+find_package(UHD REQUIRED)
+find_package(nlohmann_json REQUIRED)
 find_package(libsigmf REQUIRED)
 
 find_package(
@@ -53,4 +54,4 @@ add_test(NAME sample_pipeline_test COMMAND sample_pipeline_test)
 
 add_executable(uhd_sample_recorder uhd_sample_recorder.cpp)
 target_link_libraries(uhd_sample_recorder sample_pipeline sample_writer
-                      ${Boost_LIBRARIES} ${UHD_LIBRARIES} libsigmf::libsigmf)
+                      ${Boost_LIBRARIES} ${UHD_LIBRARIES} ${UHD_STATIC_LIB_DEPS} libsigmf::libsigmf)
