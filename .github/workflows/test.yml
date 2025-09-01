@@ -16,4 +16,4 @@ jobs:
     - uses: actions/checkout@v4
     - name: test
       run: |
-        docker build -f Dockerfile -t anarkiwi/uhd_sample_recorder
+        docker build -f Dockerfile -t anarkiwi/uhd_sample_recorder .
