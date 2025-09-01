@@ -53,5 +53,11 @@ target_link_libraries(sample_pipeline_test sample_pipeline sample_writer
 add_test(NAME sample_pipeline_test COMMAND sample_pipeline_test)
 
 add_executable(uhd_sample_recorder uhd_sample_recorder.cpp)
-target_link_libraries(uhd_sample_recorder sample_pipeline sample_writer
-                      ${Boost_LIBRARIES} ${UHD_LIBRARIES} ${UHD_STATIC_LIB_DEPS} libsigmf::libsigmf)
+target_link_libraries(
+  uhd_sample_recorder
+  sample_pipeline
+  sample_writer
+  ${Boost_LIBRARIES}
+  ${UHD_LIBRARIES}
+  ${UHD_STATIC_LIB_DEPS}
+  libsigmf::libsigmf)
