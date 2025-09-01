@@ -16,4 +16,4 @@ jobs:
     - uses: actions/checkout@v4
     - name: test
       run: |
-        ./bin/install-deps.sh && ./bin/build.sh && ./bin/test.sh
+        docker build -f Dockerfile -t anarkiwi/uhd_sample_recorder .
