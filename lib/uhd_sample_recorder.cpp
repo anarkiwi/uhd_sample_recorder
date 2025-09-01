@@ -311,8 +311,7 @@ int parse_args(int argc, char *argv[]) {
     std::stringstream ss;
     ss << "gamutrf_recording_gain" << std::fixed << std::setprecision(1) << gain
        << std::setprecision(0) << "_" << std::time(0) << "_" << uint64_t(freq)
-       << "Hz"
-       << "_" << uint64_t(rate) << "sps";
+       << "Hz" << "_" << uint64_t(rate) << "sps";
     if (type == "short") {
       ss << ".s16";
     } else {
