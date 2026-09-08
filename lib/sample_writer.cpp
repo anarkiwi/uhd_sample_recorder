@@ -2,20 +2,35 @@
 #include <boost/filesystem.hpp>
 #include <boost/iostreams/filter/gzip.hpp>
 #include <boost/iostreams/filter/zstd.hpp>
+#include <cstdio>
 #include <iostream>
 #include <sigmf/sigmf.h>
+
+static std::string parent_dir(const boost::filesystem::path &path) {
+  boost::filesystem::path parent = path.parent_path();
+  if (parent.empty()) {
+    parent = ".";
+  }
+  return boost::filesystem::canonical(parent).string();
+}
 
 std::string get_prefix_file(const std::string &file,
                             const std::string &prefix) {
   boost::filesystem::path orig_path(file);
-  std::string basename(orig_path.filename().c_str());
-  std::string dirname(
-      boost::filesystem::canonical(orig_path.parent_path()).c_str());
-  return dirname + "/" + prefix + basename;
+  return parent_dir(orig_path) + "/" + prefix + orig_path.filename().string();
 }
 
 std::string get_dotfile(const std::string &file) {
   return get_prefix_file(file, ".");
+}
+
+static bool rename_checked(const std::string &from, const std::string &to) {
+  if (rename(from.c_str(), to.c_str())) {
+    std::cerr << "could not rename " << from << " to " << to << ": "
+              << strerror(errno) << std::endl;
+    return false;
+  }
+  return true;
 }
 
 SampleWriter::SampleWriter() {
@@ -23,9 +38,18 @@ SampleWriter::SampleWriter() {
 }
 
 void SampleWriter::write(const char *data, size_t len) {
-  if (!outbuf_p->empty()) {
-    outbuf_p->write(data, len);
+  if (!opened_ || !len) {
+    return;
   }
+  outbuf_p->write(data, len);
+  if (outbuf_p->bad() || outbuf_p->fail()) {
+    if (good_) {
+      std::cerr << "write to " << dotfile_ << " failed" << std::endl;
+    }
+    good_ = false;
+    return;
+  }
+  bytes_written_ += len;
 }
 
 void SampleWriter::open(const std::string &file, size_t zlevel) {
@@ -46,23 +70,40 @@ void SampleWriter::open(const std::string &file, size_t zlevel) {
       std::cerr << "writing uncompressed output" << std::endl;
     }
   }
-  outbuf_p->push(boost::iostreams::file_sink(dotfile_));
+  boost::iostreams::file_sink sink(dotfile_);
+  if (!sink.is_open()) {
+    outbuf_p->reset();
+    throw std::runtime_error("cannot open " + dotfile_ + " for writing");
+  }
+  outbuf_p->push(sink);
+  opened_ = true;
+  good_ = true;
+  bytes_written_ = 0;
+  final_file_.clear();
 }
 
-void SampleWriter::close(size_t overflows) {
-  if (!outbuf_p->empty()) {
-    std::cerr << "closing " << file_ << std::endl;
-    outbuf_p->reset();
-
-    if (overflows) {
-      std::string dirname(
-          boost::filesystem::canonical(orig_path_.parent_path()).c_str());
-      std::string overflow_name = dirname + "/overflow-" + file_;
-      rename(dotfile_.c_str(), overflow_name.c_str());
-    } else {
-      rename(dotfile_.c_str(), file_.c_str());
-    }
+std::string SampleWriter::close(bool overflows) {
+  if (!opened_) {
+    return "";
   }
+  opened_ = false;
+  std::cerr << "closing " << file_ << std::endl;
+  outbuf_p->reset();
+
+  if (!good_) {
+    std::cerr << "not committing " << dotfile_ << ": write error" << std::endl;
+    return "";
+  }
+
+  std::string target = file_;
+  if (overflows) {
+    target = get_prefix_file(file_, "overflow-");
+  }
+  if (!rename_checked(dotfile_, target)) {
+    return "";
+  }
+  final_file_ = target;
+  return final_file_;
 }
 
 void SampleWriter::write_sigmf(const std::string &filename, double timestamp,
@@ -86,12 +127,18 @@ void SampleWriter::write_sigmf(const std::string &filename, double timestamp,
   ts_ss << std::put_time(gmtime(&timestamp_t), "%FT%TZ");
   capture.get<sigmf::core::DescrT>().datetime = ts_ss.str();
   capture.get<sigmf::capture_details::DescrT>().source_file =
-      basename(file_.c_str());
+      boost::filesystem::path(final_file_.empty() ? file_ : final_file_)
+          .filename()
+          .string();
   capture.get<sigmf::capture_details::DescrT>().gain = gain;
   record.captures.emplace_back(capture);
   std::string dotfilename = get_dotfile(filename);
   std::ofstream jsonfile(dotfilename);
   jsonfile << record.to_json();
   jsonfile.close();
-  rename(dotfilename.c_str(), filename.c_str());
+  if (!jsonfile) {
+    std::cerr << "could not write " << dotfilename << std::endl;
+    return;
+  }
+  rename_checked(dotfilename, filename);
 }

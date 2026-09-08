@@ -3,9 +3,12 @@ FROM ubuntu:24.04 AS builder
 RUN apt-get -y update && apt-get -y install sudo
 
 WORKDIR /src
+COPY bin/install-deps.sh bin/
+RUN bin/install-deps.sh
+COPY bin/build-deps.sh bin/
+RUN bin/build-deps.sh
 COPY bin bin
 COPY lib lib
-RUN bin/install-deps.sh
 RUN bin/build.sh
 RUN bin/test.sh
 
@@ -24,4 +27,4 @@ COPY --from=builder /src/build/uhd_sample_recorder /usr/local/bin
 
 RUN ldd /usr/local/bin/uhd_sample_recorder
 WORKDIR /tmp
-ENTRYPOINT ["/usr/local/bin/uhd_sample_recorder", "--novkfft"]
+ENTRYPOINT ["/usr/local/bin/uhd_sample_recorder"]
