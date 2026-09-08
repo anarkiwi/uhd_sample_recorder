@@ -2,9 +2,11 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/program_options.hpp>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <thread>
@@ -17,14 +19,18 @@
 
 #include "sample_pipeline.h"
 #include "sample_writer.h"
+#include "stream_stats.h"
 
 using json = nlohmann::json;
 namespace po = boost::program_options;
 
-std::string uhd_args, file, type, ant, subdev, ref, wirefmt;
-size_t channel, total_num_samps, spb, zlevel, rate;
-double option_rate, freq, gain, bw, total_time, setup_time, lo_offset;
-bool null, use_json_args, int_n, skip_lo;
+std::string uhd_args, file, type, ant, subdev, ref, time_source, wirefmt,
+    serial, status_file;
+size_t channel, total_num_samps, spb, zlevel, rate, num_recv_frames,
+    recv_frame_size;
+double option_rate, freq, gain, bw, total_time, setup_time, lo_offset,
+    master_clock_rate;
+bool null, use_json_args, int_n, skip_lo, any_decim;
 static volatile std::sig_atomic_t stop_streaming;
 po::variables_map vm;
 
@@ -77,7 +83,7 @@ void ref_lock(uhd::usrp::multi_usrp::sptr usrp, const std::string &ref,
   std::string ref_name;
   if (ref == "mimo") {
     ref_name = "mimo_locked";
-  } else if (ref == "external") {
+  } else if (ref == "external" || ref == "gpsdo") {
     ref_name = "ref_locked";
   }
   if (ref_name.empty()) {
@@ -110,67 +116,137 @@ void tune(uhd::usrp::multi_usrp::sptr usrp, size_t channel, double freq,
 
 void sig_int_handler(int) { stop_streaming = 1; }
 
-bool run_stream(uhd::rx_streamer::sptr rx_stream, double time_requested,
-                size_t max_samples, size_t num_requested_samples) {
-  bool overflows = false;
-  size_t num_total_samps = 0;
+StreamStats run_stream(uhd::rx_streamer::sptr rx_stream, double time_requested,
+                       size_t max_samples, size_t num_requested_samples,
+                       double rate) {
+  // A duration is a sample budget too, so a run that loses samples is short
+  // by exactly what it lost rather than by whatever the wall clock allowed.
+  size_t expected = num_requested_samples;
+  if (!expected && time_requested) {
+    expected = size_t(llround(time_requested * rate));
+  }
+  StreamStats stats(rate, expected);
   size_t buffer_ptr = 0;
   char *buffer_p = NULL;
   const auto stop_time =
       std::chrono::steady_clock::now() +
-      std::chrono::milliseconds(int64_t(1000 * time_requested));
+      std::chrono::milliseconds(int64_t(1000 * time_requested) + 1000);
   stop_streaming = 0;
 
   for (;;) {
     // Never recv() into a buffer the writer still owns.
+    bool stalled = false;
     while (buffer_p == NULL) {
       if (stop_streaming)
-        return overflows;
-      if (!acquire_sample_buffer(buffer_ptr, &buffer_p, NULL))
+        return stats;
+      if (!acquire_sample_buffer(buffer_ptr, &buffer_p, NULL)) {
+        stalled = true;
         usleep(100);
+      }
+    }
+    if (stalled) {
+      stats.count_stall();
     }
 
     uhd::rx_metadata_t md;
     const size_t num_rx_samps =
         rx_stream->recv(buffer_p, max_samples, md, 3.0, false);
-    bool fatal = false;
+    stats.account(md, num_rx_samps, max_samples);
 
     switch (md.error_code) {
     case uhd::rx_metadata_t::ERROR_CODE_NONE:
       break;
-    case uhd::rx_metadata_t::ERROR_CODE_TIMEOUT:
-      std::cerr << "ERROR_CODE_TIMEOUT" << std::endl;
-      fatal = true;
-      break;
     case uhd::rx_metadata_t::ERROR_CODE_OVERFLOW:
       // Recoverable: the device dropped samples, the stream continues.
-      std::cerr << "ERROR_CODE_OVERFLOW" << std::endl;
-      overflows = true;
+      std::cerr << "O" << std::flush;
       break;
     default:
       std::cerr << md.strerror() << std::endl;
-      fatal = true;
       break;
     }
 
     if (num_rx_samps) {
-      num_total_samps += num_rx_samps;
       enqueue_samples(buffer_ptr, num_rx_samps * get_samp_size());
       buffer_p = NULL;
     }
 
-    if (fatal or stop_streaming)
+    if (stats.fatal() or stop_streaming)
       break;
-    if (num_requested_samples and num_total_samps >= num_requested_samples)
+    if (expected and stats.samples() + stats.dropped() >= expected)
       break;
     if (time_requested and std::chrono::steady_clock::now() >= stop_time)
       break;
   }
 
-  return overflows;
+  return stats;
 }
 
-void sample_record(uhd::usrp::multi_usrp::sptr usrp, const std::string &type,
+static void add_sensor(
+    json &j, const std::string &name, const std::vector<std::string> &names,
+    std::function<uhd::sensor_value_t(const std::string &)> get_sensor_fn) {
+  if (std::find(names.begin(), names.end(), name) == names.end()) {
+    j[name] = nullptr;
+    return;
+  }
+  j[name] = get_sensor_fn(name).to_bool();
+}
+
+// What UHD reports after configuration, which is not necessarily what was
+// asked for.
+json describe_usrp(uhd::usrp::multi_usrp::sptr usrp) {
+  json j;
+  const uhd::dict<std::string, std::string> info =
+      usrp->get_usrp_rx_info(channel);
+  j["mboard"] = info.get("mboard_id", std::string());
+  j["serial"] = info.get("mboard_serial", std::string());
+  j["antenna"] = usrp->get_rx_antenna(channel);
+  j["freq"] = usrp->get_rx_freq(channel);
+  j["requested_freq"] = freq;
+  j["lo_offset"] = lo_offset;
+  const double actual_rate = usrp->get_rx_rate(channel);
+  j["rate"] = actual_rate;
+  j["requested_rate"] = option_rate;
+  j["gain"] = usrp->get_rx_gain(channel);
+  j["requested_gain"] = gain;
+  j["bandwidth"] = usrp->get_rx_bandwidth(channel);
+  const double mcr = usrp->get_master_clock_rate();
+  j["master_clock_rate"] = mcr;
+  j["decimation"] = actual_rate > 0 ? mcr / actual_rate : 0.0;
+  j["clock_source"] = usrp->get_clock_source(0);
+  j["time_source"] = usrp->get_time_source(0);
+  const std::vector<std::string> mboard_sensors =
+      usrp->get_mboard_sensor_names(0);
+  add_sensor(j, "ref_locked", mboard_sensors, [usrp](const std::string &n) {
+    return usrp->get_mboard_sensor(n);
+  });
+  add_sensor(j, "gps_locked", mboard_sensors, [usrp](const std::string &n) {
+    return usrp->get_mboard_sensor(n);
+  });
+  add_sensor(
+      j, "lo_locked", usrp->get_rx_sensor_names(channel),
+      [usrp](const std::string &n) { return usrp->get_rx_sensor(n, channel); });
+  return j;
+}
+
+void write_status_file(const json &report) {
+  if (status_file.empty()) {
+    return;
+  }
+  const std::string dotfile = get_prefix_file(status_file, ".");
+  std::ofstream out(dotfile);
+  out << report.dump() << std::endl;
+  out.close();
+  if (!out) {
+    std::cerr << "could not write " << dotfile << std::endl;
+    return;
+  }
+  if (rename(dotfile.c_str(), status_file.c_str())) {
+    std::cerr << "could not rename " << dotfile << " to " << status_file
+              << std::endl;
+  }
+}
+
+json sample_record(uhd::usrp::multi_usrp::sptr usrp, const std::string &type,
                    const std::string &wire_format, const size_t &channel,
                    const std::string &file, const size_t rate,
                    const size_t samps_per_buff, const size_t zlevel,
@@ -197,18 +273,21 @@ void sample_record(uhd::usrp::multi_usrp::sptr usrp, const std::string &type,
 
   sample_pipeline_start(file, max_samples, zlevel);
 
-  uhd::stream_cmd_t stream_cmd(
-      (num_requested_samples == 0)
-          ? uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS
-          : uhd::stream_cmd_t::STREAM_MODE_NUM_SAMPS_AND_DONE);
-  stream_cmd.num_samps = size_t(num_requested_samples);
+  // Always continuous: the host stops on its own sample budget, so an
+  // overflow leaves a short recording that the report accounts for, not a
+  // stream the device ended early.
+  uhd::stream_cmd_t stream_cmd(uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS);
   stream_cmd.stream_now = true;
   stream_cmd.time_spec = uhd::time_spec_t();
+  const auto start_clock = std::chrono::steady_clock::now();
   rx_stream->issue_stream_cmd(stream_cmd);
 
-  bool overflows =
-      run_stream(rx_stream, time_requested, max_samples, num_requested_samples);
+  const StreamStats stats = run_stream(rx_stream, time_requested, max_samples,
+                                       num_requested_samples, rate);
 
+  const double elapsed = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - start_clock)
+                             .count();
   double timestamp =
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::high_resolution_clock::now().time_since_epoch())
@@ -218,11 +297,24 @@ void sample_record(uhd::usrp::multi_usrp::sptr usrp, const std::string &type,
   rx_stream->issue_stream_cmd(stream_cmd);
   std::cerr << "stream stopped" << std::endl;
   const PipelineResult result = sample_pipeline_stop(
-      overflows, rate, freq, timestamp, gain, sigmf_format);
+      stats.overflows() > 0, rate, freq, timestamp, gain, sigmf_format);
   std::cerr << "pipeline stopped" << std::endl;
+
+  json report = stats.to_json();
+  report["file"] = result.file;
+  report["sigmf_meta"] =
+      result.file.empty() ? std::string() : result.file + ".sigmf-meta";
+  report["write_ok"] = result.ok;
+  report["bytes_written"] = result.bytes;
+  report["samples_written"] = result.bytes / get_samp_size();
+  report["elapsed"] = elapsed;
+  report["timestamp"] = timestamp;
+  report["radio"] = describe_usrp(usrp);
+  write_status_file(report);
   if (!result.ok) {
     throw std::runtime_error("could not commit " + file);
   }
+  return report;
 }
 
 int parse_args(int argc, char *argv[]) {
@@ -231,6 +323,12 @@ int parse_args(int argc, char *argv[]) {
   desc.add_options()("help", "help message")(
       "args", po::value<std::string>(&uhd_args)->default_value(""),
       "multi uhd device address args")(
+      "serial", po::value<std::string>(&serial)->default_value(""),
+      "pin the device by serial number (added to --args)")(
+      "num_recv_frames", po::value<size_t>(&num_recv_frames)->default_value(0),
+      "USB transport receive frames (added to --args, 0 to leave alone)")(
+      "recv_frame_size", po::value<size_t>(&recv_frame_size)->default_value(0),
+      "USB transport receive frame size (added to --args, 0 to leave alone)")(
       "file", po::value<std::string>(&file)->default_value(""),
       "name of the file to write binary samples to")(
       "type", po::value<std::string>(&type)->default_value("short"),
@@ -257,7 +355,16 @@ int parse_args(int argc, char *argv[]) {
       "which channel to use")("bw", po::value<double>(&bw),
                               "analog frontend filter bandwidth in Hz")(
       "ref", po::value<std::string>(&ref)->default_value("internal"),
-      "reference source (internal, external, mimo)")(
+      "clock source (internal, external, mimo, gpsdo)")(
+      "time-source", po::value<std::string>(&time_source)->default_value(""),
+      "time source (internal, external, gpsdo; default leave alone)")(
+      "master-clock-rate",
+      po::value<double>(&master_clock_rate)->default_value(0),
+      "master clock rate in Hz (0 to leave alone)")(
+      "any-decim", "allow a master clock rate that is not an integer "
+                   "multiple of the sample rate")(
+      "status-file", po::value<std::string>(&status_file)->default_value(""),
+      "write the per recording JSON report here as well as to stdout")(
       "wirefmt", po::value<std::string>(&wirefmt)->default_value("sc16"),
       "wire format (sc8, sc16)")(
       "setup", po::value<double>(&setup_time)->default_value(1.0),
@@ -269,6 +376,7 @@ int parse_args(int argc, char *argv[]) {
   po::notify(vm);
 
   null = vm.count("null") > 0;
+  any_decim = vm.count("any-decim") > 0;
   use_json_args = vm.count("json") > 0;
   int_n = vm.count("int-n") > 0;
   skip_lo = vm.count("skip-lo") > 0;
@@ -343,8 +451,8 @@ void serve_json(uhd::usrp::multi_usrp::sptr usrp) {
     if (!skip_lo) {
       lo_lock(usrp, channel, setup_time);
     }
-    sample_record(usrp, type, wirefmt, channel, file, rate, spb, zlevel,
-                  total_num_samps, total_time);
+    status["record"] = sample_record(usrp, type, wirefmt, channel, file, rate,
+                                     spb, zlevel, total_num_samps, total_time);
     last_error = "";
   }
 }
@@ -354,29 +462,73 @@ void serve_once(uhd::usrp::multi_usrp::sptr usrp) {
     std::cerr << "^C to stop" << std::endl;
   }
 
-  sample_record(usrp, type, wirefmt, channel, file, rate, spb, zlevel,
-                total_num_samps, total_time);
+  const json report = sample_record(usrp, type, wirefmt, channel, file, rate,
+                                    spb, zlevel, total_num_samps, total_time);
+  std::cout << report << std::endl;
+}
+
+// --serial and the transport options are device args; setting them here
+// keeps them out of the string the caller has to hand assemble.
+std::string build_device_args() {
+  uhd::device_addr_t args(uhd_args);
+  if (serial.size()) {
+    args["serial"] = serial;
+  }
+  if (num_recv_frames) {
+    args["num_recv_frames"] = std::to_string(num_recv_frames);
+  }
+  if (recv_frame_size) {
+    args["recv_frame_size"] = std::to_string(recv_frame_size);
+  }
+  return args.to_string();
 }
 
 void init_usrp(uhd::usrp::multi_usrp::sptr usrp) {
   std::cerr << boost::format("using: %s") % usrp->get_pp_string() << std::endl;
 
-  if (vm.count("ref")) {
-    usrp->set_clock_source(ref);
-  }
+  usrp->set_clock_source(ref);
+
+  if (time_source.size())
+    usrp->set_time_source(time_source);
 
   if (vm.count("subdev"))
     usrp->set_rx_subdev_spec(subdev);
 
-  if (vm.count("ant"))
+  if (vm.count("ant")) {
     usrp->set_rx_antenna(ant, channel);
+  } else {
+    std::cerr << boost::format(
+                     "warning: no --ant given, using device default \"%s\"") %
+                     usrp->get_rx_antenna(channel)
+              << std::endl;
+  }
+
+  // Must precede set_rx_rate: changing it resets the rate.
+  if (master_clock_rate > 0) {
+    usrp->set_master_clock_rate(master_clock_rate);
+  }
 
   std::cerr << boost::format("setting RX rate: %f Msps...") % (rate / 1e6)
             << std::endl;
   usrp->set_rx_rate(rate, channel);
-  std::cerr << boost::format("actual RX rate: %f Msps...") %
-                   (usrp->get_rx_rate(channel) / 1e6)
+  const double actual_rate = usrp->get_rx_rate(channel);
+  std::cerr << boost::format("actual RX rate: %f Msps...") % (actual_rate / 1e6)
             << std::endl;
+
+  // UHD decimates by a whole number; a non integer ratio is a silent
+  // resample.
+  const double actual_mcr = usrp->get_master_clock_rate();
+  const double decim = actual_rate > 0 ? actual_mcr / actual_rate : 0;
+  if (std::abs(decim - std::round(decim)) > 1e-6) {
+    const std::string decim_msg =
+        str(boost::format("master clock rate %f is not an integer multiple of "
+                          "sample rate %f (ratio %f)") %
+            actual_mcr % actual_rate % decim);
+    if (!any_decim) {
+      throw std::runtime_error(decim_msg);
+    }
+    std::cerr << "warning: " << decim_msg << std::endl;
+  }
 
   if (vm.count("gain")) {
     std::cerr << boost::format("setting RX gain: %f dB...") % gain << std::endl;
@@ -410,9 +562,10 @@ int UHD_SAFE_MAIN(int argc, char *argv[]) {
   if (parse_args(argc, argv))
     return ~0;
 
-  std::cerr << boost::format("creating usrp device with: %s...") % uhd_args
+  const std::string device_args = build_device_args();
+  std::cerr << boost::format("creating usrp device with: %s...") % device_args
             << std::endl;
-  uhd::usrp::multi_usrp::sptr usrp = uhd::usrp::multi_usrp::make(uhd_args);
+  uhd::usrp::multi_usrp::sptr usrp = uhd::usrp::multi_usrp::make(device_args);
   init_usrp(usrp);
   std::signal(SIGINT, &sig_int_handler);
 
