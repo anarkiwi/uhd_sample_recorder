@@ -20,11 +20,10 @@
 using json = nlohmann::json;
 namespace po = boost::program_options;
 
-std::string uhd_args, file, fft_file, type, ant, subdev, ref, wirefmt;
-size_t channel, total_num_samps, spb, zlevel, rate, nfft, nfft_overlap,
-    nfft_div, nfft_ds, batches, sample_id;
+std::string uhd_args, file, type, ant, subdev, ref, wirefmt;
+size_t channel, total_num_samps, spb, zlevel, rate;
 double option_rate, freq, gain, bw, total_time, setup_time, lo_offset;
-bool null, fftnull, use_vkfft, use_json_args, int_n, skip_lo;
+bool null, use_json_args, int_n, skip_lo;
 static bool stop_streaming;
 po::variables_map vm;
 
@@ -156,13 +155,10 @@ bool run_stream(uhd::rx_streamer::sptr rx_stream, double time_requested,
 
 void sample_record(uhd::usrp::multi_usrp::sptr usrp, const std::string &type,
                    const std::string &wire_format, const size_t &channel,
-                   const std::string &file, const std::string &fft_file,
-                   const size_t rate, const size_t samps_per_buff,
-                   const size_t zlevel, const size_t num_requested_samples,
-                   const double time_requested, const bool use_vkfft,
-                   const size_t nfft, const size_t nfft_overlap,
-                   const size_t nfft_div, const size_t nfft_ds,
-                   const size_t batches, const size_t sample_id) {
+                   const std::string &file, const size_t rate,
+                   const size_t samps_per_buff, const size_t zlevel,
+                   const size_t num_requested_samples,
+                   const double time_requested) {
   std::string cpu_format;
   set_sample_pipeline_types(type, cpu_format);
 
@@ -182,17 +178,7 @@ void sample_record(uhd::usrp::multi_usrp::sptr usrp, const std::string &type,
   const std::string sigmf_format =
       type == "short" ? "ci16" + endian_str : "cf32" + endian_str;
 
-  if (nfft) {
-    std::cerr << "using FFT point size " << nfft << std::endl;
-
-    if (samps_per_buff % nfft) {
-      throw std::runtime_error("FFT point size must be a factor of spb");
-    }
-  }
-
-  sample_pipeline_start(file, fft_file, max_samples, zlevel, use_vkfft, nfft,
-                        nfft_overlap, nfft_div, nfft_ds, rate, batches,
-                        sample_id);
+  sample_pipeline_start(file, max_samples, zlevel);
 
   uhd::stream_cmd_t stream_cmd(
       (num_requested_samples == 0)
@@ -256,30 +242,13 @@ int parse_args(int argc, char *argv[]) {
       "wire format (sc8, sc16)")(
       "setup", po::value<double>(&setup_time)->default_value(1.0),
       "seconds of setup time")("null", "run without writing to file")(
-      "fftnull", "run without writing to FFT file")(
       "skip-lo", "skip checking LO lock status")(
       "int-n", "tune USRP with integer-N tuning")(
-      "nfft", po::value<size_t>(&nfft)->default_value(0),
-      "if > 0, calculate n FFT points")(
-      "nfft_overlap", po::value<size_t>(&nfft_overlap)->default_value(0),
-      "FFT overlap")(
-      "nfft_div", po::value<size_t>(&nfft_div)->default_value(50),
-      "calculate FFT over sample rate / n samples (e.g 50 == 20ms)")(
-      "nfft_ds", po::value<size_t>(&nfft_ds)->default_value(1),
-      "NFFT downsampling interval")(
-      "fft_file", po::value<std::string>(&fft_file)->default_value(""),
-      "name of file to write FFT points to (default derive from --file)")(
-      "novkfft", "do not use vkFFT (use software FFT)")(
-      "vkfft_batches", po::value<size_t>(&batches)->default_value(100),
-      "vkFFT batches")(
-      "vkfft_sample_id", po::value<size_t>(&sample_id)->default_value(0),
-      "vkFFT sample_id")("json", "take parameters from json on stdin");
+      "json", "take parameters from json on stdin");
   po::store(po::parse_command_line(argc, argv, desc), vm);
   po::notify(vm);
 
   null = vm.count("null") > 0;
-  fftnull = vm.count("fftnull") > 0;
-  use_vkfft = vm.count("novkfft") == 0;
   use_json_args = vm.count("json") > 0;
   int_n = vm.count("int-n") > 0;
   skip_lo = vm.count("skip-lo") > 0;
@@ -297,10 +266,6 @@ int parse_args(int argc, char *argv[]) {
     throw std::runtime_error("invalid sample rate");
   }
   rate = size_t(option_rate);
-
-  if (rate % nfft_div) {
-    throw std::runtime_error("nfft_div must be a factor of sample rate");
-  }
 
   if (spb == 0) {
     spb = rate;
@@ -321,16 +286,8 @@ int parse_args(int argc, char *argv[]) {
     file = ss.str();
   }
 
-  if (!fft_file.size()) {
-    fft_file = get_prefix_file(file, "fft_");
-  }
-
   if (null) {
     file.clear();
-  }
-
-  if (fftnull || nfft == 0) {
-    fft_file.clear();
   }
 
   return 0;
@@ -356,11 +313,8 @@ void serve_json(uhd::usrp::multi_usrp::sptr usrp) {
     }
     try {
       file = json_args.value("file", file);
-      fft_file = json_args.value("fft_file", fft_file);
       total_time = json_args.value("duration", total_time);
       freq = json_args.value("freq", freq);
-      nfft = json_args.value("nfft", nfft);
-      nfft_overlap = json_args.value("nfft_overlap", nfft_overlap);
     } catch (json::basic_json::type_error &ex) {
       last_error = "json parameter type error";
       continue;
@@ -369,9 +323,8 @@ void serve_json(uhd::usrp::multi_usrp::sptr usrp) {
     if (!skip_lo) {
       lo_lock(usrp, ref, channel, setup_time);
     }
-    sample_record(usrp, type, wirefmt, channel, file, fft_file, rate, spb,
-                  zlevel, total_num_samps, total_time, use_vkfft, nfft,
-                  nfft_overlap, nfft_div, nfft_ds, batches, sample_id);
+    sample_record(usrp, type, wirefmt, channel, file, rate, spb, zlevel,
+                  total_num_samps, total_time);
     last_error = "";
   }
 }
@@ -381,9 +334,8 @@ void serve_once(uhd::usrp::multi_usrp::sptr usrp) {
     std::cerr << "^C to stop" << std::endl;
   }
 
-  sample_record(usrp, type, wirefmt, channel, file, fft_file, rate, spb, zlevel,
-                total_num_samps, total_time, use_vkfft, nfft, nfft_overlap,
-                nfft_div, nfft_ds, batches, sample_id);
+  sample_record(usrp, type, wirefmt, channel, file, rate, spb, zlevel,
+                total_num_samps, total_time);
 }
 
 void init_usrp(uhd::usrp::multi_usrp::sptr usrp) {
