@@ -13,6 +13,7 @@
 #include <uhd/usrp/multi_usrp.hpp>
 #include <uhd/utils/safe_main.hpp>
 #include <uhd/utils/thread.hpp>
+#include <unistd.h>
 
 #include "sample_pipeline.h"
 #include "sample_writer.h"
@@ -24,39 +25,42 @@ std::string uhd_args, file, type, ant, subdev, ref, wirefmt;
 size_t channel, total_num_samps, spb, zlevel, rate;
 double option_rate, freq, gain, bw, total_time, setup_time, lo_offset;
 bool null, use_json_args, int_n, skip_lo;
-static bool stop_streaming;
+static volatile std::sig_atomic_t stop_streaming;
 po::variables_map vm;
 
+// True if locked, false if the board has no such sensor, throws on timeout.
 bool check_sensor_lock(
-    std::vector<std::string> sensor_names, const std::string &sensor_name,
+    const std::vector<std::string> &sensor_names,
+    const std::string &sensor_name,
     std::function<uhd::sensor_value_t(const std::string &)> get_sensor_fn,
     double setup_time) {
   if (std::find(sensor_names.begin(), sensor_names.end(), sensor_name) ==
       sensor_names.end())
     return false;
 
-  auto setup_timeout = std::chrono::steady_clock::now() +
-                       std::chrono::milliseconds(int64_t(setup_time * 1000));
-  bool lock_detected = false;
+  const auto setup_timeout =
+      std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(int64_t(setup_time * 1000));
 
   std::cerr << boost::format("waiting for \"%s\" lock: ") % sensor_name;
   std::cerr.flush();
 
-  while (std::chrono::steady_clock::now() < setup_timeout) {
-    if (!lock_detected) {
-      lock_detected = get_sensor_fn(sensor_name).to_bool();
+  for (;;) {
+    if (get_sensor_fn(sensor_name).to_bool()) {
+      std::cerr << "locked" << std::endl;
+      return true;
     }
+    if (std::chrono::steady_clock::now() >= setup_timeout)
+      break;
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
-  if (!lock_detected) {
-    throw std::runtime_error(
-        str(boost::format("timed out waiting for lock on sensor \"%s\"") %
-            sensor_name));
-  }
-  return true;
+  std::cerr << "not locked" << std::endl;
+  throw std::runtime_error(
+      str(boost::format("timed out waiting for lock on sensor \"%s\"") %
+          sensor_name));
 }
 
-void lo_lock(uhd::usrp::multi_usrp::sptr usrp, std::string &ref, size_t channel,
+void lo_lock(uhd::usrp::multi_usrp::sptr usrp, size_t channel,
              double setup_time) {
   check_sensor_lock(
       usrp->get_rx_sensor_names(channel), "lo_locked",
@@ -64,20 +68,29 @@ void lo_lock(uhd::usrp::multi_usrp::sptr usrp, std::string &ref, size_t channel,
         return usrp->get_rx_sensor(sensor_name, channel);
       },
       setup_time);
-  std::string ref_name = "";
+}
+
+// A non-internal reference that cannot be verified is an error, not a
+// silently unchecked reference.
+void ref_lock(uhd::usrp::multi_usrp::sptr usrp, const std::string &ref,
+              double setup_time) {
+  std::string ref_name;
   if (ref == "mimo") {
     ref_name = "mimo_locked";
-  }
-  if (ref == "external") {
+  } else if (ref == "external") {
     ref_name = "ref_locked";
   }
-  if (ref_name != "") {
-    check_sensor_lock(
-        usrp->get_mboard_sensor_names(0), ref_name,
-        [usrp](const std::string &sensor_name) {
-          return usrp->get_mboard_sensor(sensor_name);
-        },
-        setup_time);
+  if (ref_name.empty()) {
+    return;
+  }
+  if (!check_sensor_lock(
+          usrp->get_mboard_sensor_names(0), ref_name,
+          [usrp](const std::string &sensor_name) {
+            return usrp->get_mboard_sensor(sensor_name);
+          },
+          setup_time)) {
+    throw std::runtime_error("no \"" + ref_name + "\" sensor: cannot verify " +
+                             ref + " reference lock");
   }
 }
 
@@ -91,60 +104,64 @@ void tune(uhd::usrp::multi_usrp::sptr usrp, size_t channel, double freq,
   std::cerr << boost::format("Set RX freq %f MHz with LO offset %f MHz, got "
                              "actual RX freq: %f MHz...") %
                    (freq / 1e6) % (lo_offset / 1e6) %
-                   (usrp->get_rx_freq(channel / 1e6))
+                   (usrp->get_rx_freq(channel) / 1e6)
             << std::endl;
 }
 
-void sig_int_handler(int) { stop_streaming = true; }
+void sig_int_handler(int) { stop_streaming = 1; }
 
 bool run_stream(uhd::rx_streamer::sptr rx_stream, double time_requested,
                 size_t max_samples, size_t num_requested_samples) {
   bool overflows = false;
-  size_t write_ptr = 0;
   size_t num_total_samps = 0;
+  size_t buffer_ptr = 0;
+  char *buffer_p = NULL;
   const auto stop_time =
       std::chrono::steady_clock::now() +
       std::chrono::milliseconds(int64_t(1000 * time_requested));
-  stop_streaming = false;
+  stop_streaming = 0;
 
   for (;;) {
+    // Never recv() into a buffer the writer still owns.
+    while (buffer_p == NULL) {
+      if (stop_streaming)
+        return overflows;
+      if (!acquire_sample_buffer(buffer_ptr, &buffer_p, NULL))
+        usleep(100);
+    }
+
     uhd::rx_metadata_t md;
-    size_t buffer_capacity = 0;
-    char *buffer_p = get_sample_buffer(write_ptr, &buffer_capacity);
-    size_t num_rx_samps =
+    const size_t num_rx_samps =
         rx_stream->recv(buffer_p, max_samples, md, 3.0, false);
+    bool fatal = false;
 
     switch (md.error_code) {
     case uhd::rx_metadata_t::ERROR_CODE_NONE:
       break;
     case uhd::rx_metadata_t::ERROR_CODE_TIMEOUT:
       std::cerr << "ERROR_CODE_TIMEOUT" << std::endl;
-      stop_streaming = true;
+      fatal = true;
       break;
     case uhd::rx_metadata_t::ERROR_CODE_OVERFLOW:
+      // Recoverable: the device dropped samples, the stream continues.
       std::cerr << "ERROR_CODE_OVERFLOW" << std::endl;
       overflows = true;
-      stop_streaming = true;
       break;
     default:
-      stop_streaming = true;
       std::cerr << md.strerror() << std::endl;
+      fatal = true;
       break;
     }
 
-    num_total_samps += num_rx_samps;
-    size_t samp_bytes = num_rx_samps * get_samp_size();
-    if (samp_bytes != buffer_capacity) {
-      std::cerr << "resize to " << samp_bytes << " from " << buffer_capacity
-                << std::endl;
-      set_sample_buffer_capacity(write_ptr, samp_bytes);
+    if (num_rx_samps) {
+      num_total_samps += num_rx_samps;
+      enqueue_samples(buffer_ptr, num_rx_samps * get_samp_size());
+      buffer_p = NULL;
     }
 
-    enqueue_samples(write_ptr);
-
-    if (stop_streaming)
+    if (fatal or stop_streaming)
       break;
-    if (num_requested_samples and num_requested_samples >= num_total_samps)
+    if (num_requested_samples and num_total_samps >= num_requested_samples)
       break;
     if (time_requested and std::chrono::steady_clock::now() >= stop_time)
       break;
@@ -200,9 +217,12 @@ void sample_record(uhd::usrp::multi_usrp::sptr usrp, const std::string &type,
   stream_cmd.stream_mode = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
   rx_stream->issue_stream_cmd(stream_cmd);
   std::cerr << "stream stopped" << std::endl;
-  sample_pipeline_stop(overflows, file, rate, freq, timestamp, gain,
-                       sigmf_format);
+  const PipelineResult result = sample_pipeline_stop(
+      overflows, rate, freq, timestamp, gain, sigmf_format);
   std::cerr << "pipeline stopped" << std::endl;
+  if (!result.ok) {
+    throw std::runtime_error("could not commit " + file);
+  }
 }
 
 int parse_args(int argc, char *argv[]) {
@@ -321,7 +341,7 @@ void serve_json(uhd::usrp::multi_usrp::sptr usrp) {
     }
     tune(usrp, channel, freq, lo_offset, int_n);
     if (!skip_lo) {
-      lo_lock(usrp, ref, channel, setup_time);
+      lo_lock(usrp, channel, setup_time);
     }
     sample_record(usrp, type, wirefmt, channel, file, rate, spb, zlevel,
                   total_num_samps, total_time);
@@ -376,12 +396,14 @@ void init_usrp(uhd::usrp::multi_usrp::sptr usrp) {
   }
 
   tune(usrp, channel, freq, lo_offset, int_n);
-  if (!skip_lo) {
-    lo_lock(usrp, ref, channel, setup_time);
-  }
 
   std::this_thread::sleep_for(
       std::chrono::milliseconds(int64_t(1000 * setup_time)));
+
+  if (!skip_lo) {
+    lo_lock(usrp, channel, setup_time);
+  }
+  ref_lock(usrp, ref, setup_time);
 }
 
 int UHD_SAFE_MAIN(int argc, char *argv[]) {
